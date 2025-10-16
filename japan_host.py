@@ -24,6 +24,14 @@ import shutil
 import uuid
 from typing import List, Dict, Tuple
 import re
+import mimetypes
+import ssl
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import urllib3
+
+# Disable SSL warnings if needed
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Configure logging with detailed format and file output
 logging.basicConfig(
@@ -36,66 +44,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def load_secrets():
-    """Load configuration from Streamlit secrets with environment variable fallbacks"""
-    try:
-        # Try Streamlit secrets first
-        replicate_key = st.secrets["api_keys"]["REPLICATE_API_KEY"]
-        comfyui_url = st.secrets["servers"]["COMFYUI_SERVER_URL"]
-        logger.info("Successfully loaded secrets from Streamlit secrets")
-        
-        # Validate that secrets are not empty
-        if not replicate_key or not replicate_key.strip():
-            raise ValueError("REPLICATE_API_KEY is empty")
-        if not comfyui_url or not comfyui_url.strip():
-            raise ValueError("COMFYUI_SERVER_URL is empty")
-            
-        return replicate_key.strip(), comfyui_url.strip()
-        
-    except (KeyError, AttributeError) as e:
-        logger.warning(f"Streamlit secrets not found: {e}. Trying environment variables...")
-        
-        # Fallback to environment variables (for local development)
-        replicate_key = os.getenv("REPLICATE_API_KEY")
-        comfyui_url = os.getenv("COMFYUI_SERVER_URL", "http://34.142.205.152/comfy")
-        
-        if not replicate_key:
-            st.error("""
-            🔑 **API Configuration Required**
-            
-            Please configure your API keys using one of these methods:
-            
-            **For Streamlit Cloud:**
-            1. Go to your app settings
-            2. Add secrets in the format:
-            ```
-            [api_keys]
-            REPLICATE_API_KEY = "your_key_here"
-            
-            [servers]
-            COMFYUI_SERVER_URL = "your_server_url"
-            ```
-            
-            **For Local Development:**
-            1. Create `.streamlit/secrets.toml` with the same format above, OR
-            2. Set environment variable: `export REPLICATE_API_KEY="your_key_here"`
-            """)
-            st.stop()
-        
-        logger.info("Successfully loaded secrets from environment variables")
-        return replicate_key.strip(), comfyui_url.strip()
-    
-    except Exception as e:
-        st.error(f"Error loading configuration: {e}")
-        st.stop()
+# API Keys - Use Streamlit secrets for hosting
+REPLICATE_API_KEY = st.secrets["REPLICATE_API_KEY"]
+ARK_API_KEY = st.secrets["ARK_API_KEY"]
+COMFYUI_SERVER_URL = st.secrets.get("COMFYUI_SERVER_URL", "http://34.142.205.152/comfy")
 
-# Load API configuration
-try:
-    REPLICATE_API_KEY, COMFYUI_SERVER_URL = load_secrets()
-except Exception as e:
-    logger.error(f"Failed to load secrets: {e}")
-    st.error("Failed to load API configuration. Please check your secrets setup.")
-    st.stop()
+# Seedream API Configuration
+SEEDREAM_API_URL = "https://ark.ap-southeast.bytepluses.com/api/v3/images/generations"
 
 # Streamlit page configuration
 st.set_page_config(
@@ -104,6 +59,16 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+class SSLAdapter(HTTPAdapter):
+    """Custom SSL adapter to handle SSL connection issues"""
+    def init_poolmanager(self, *args, **kwargs):
+        context = ssl.create_default_context()
+        context.set_ciphers('DEFAULT@SECLEVEL=1')
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        kwargs['ssl_context'] = context
+        return super().init_poolmanager(*args, **kwargs)
 
 class ExpressionFilter:
     """Filter to remove expressions from prompts"""
@@ -178,7 +143,7 @@ class ExpressionFilter:
 
 class ComfyUIFaceSwapProcessor:
     """Face swap processor using ComfyUI"""
-    def __init__(self, server_url, max_workers=10):
+    def __init__(self, server_url="http://34.142.205.152/comfy", max_workers=10):
         self.server_url = server_url
         self.max_workers = max_workers
         self.session = requests.Session()
@@ -395,9 +360,48 @@ class StreamlitImageGenerator:
         self.face_swap_processor = None
         self.expression_filter = ExpressionFilter()
         
+        # Thread-local storage for sessions
+        self.local = threading.local()
+        
     def initialize_face_swap(self, comfyui_server_url):
         """Initialize face swap processor"""
         self.face_swap_processor = ComfyUIFaceSwapProcessor(server_url=comfyui_server_url)
+        
+    def get_session(self):
+        """Get or create a thread-local session for Seedream API"""
+        if not hasattr(self.local, 'session'):
+            # Create session for this thread
+            session = requests.Session()
+            
+            # Set up retry strategy
+            retry_strategy = Retry(
+                total=3,
+                backoff_factor=1,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["HEAD", "GET", "POST"]
+            )
+            
+            # Mount adapters with SSL configuration
+            ssl_adapter = SSLAdapter(max_retries=retry_strategy)
+            session.mount("https://", ssl_adapter)
+            session.mount("http://", HTTPAdapter(max_retries=retry_strategy))
+            
+            # Set headers
+            session.headers.update({
+                "Authorization": f"Bearer {ARK_API_KEY}",
+                "Content-Type": "application/json",
+                "User-Agent": "SeedrameImageGenerator/1.0",
+                "Accept": "application/json",
+                "Connection": "keep-alive"
+            })
+            
+            # Configure session settings
+            session.verify = False  # Disable SSL verification as fallback
+            
+            self.local.session = session
+            logger.debug(f"Created new session for thread: {threading.current_thread().name}")
+        
+        return self.local.session
         
     def extract_images_from_zip(self, zip_file_bytes, temp_dir):
         """Extract images from uploaded ZIP file bytes to temporary directory"""
@@ -468,64 +472,15 @@ class StreamlitImageGenerator:
             with open(image_path, 'rb') as image_file:
                 image_data = image_file.read()
                 base64_string = base64.b64encode(image_data).decode('utf-8')
-                return f"data:image/jpeg;base64,{base64_string}"
+                
+                # Get MIME type
+                mime_type, _ = mimetypes.guess_type(image_path)
+                if not mime_type or not mime_type.startswith('image/'):
+                    mime_type = 'image/jpeg'  # Default fallback
+                
+                return f"data:{mime_type};base64,{base64_string}"
         except Exception as e:
             logger.error(f"Error encoding image {image_path}: {str(e)}")
-            return None
-    
-    def upload_image_to_temp_host(self, image_path):
-        """Upload image to temporary hosting service and return URL"""
-        try:
-            # Using tmpfiles.org as a temporary hosting service
-            # Alternative services: 0x0.st, transfer.sh, etc.
-            
-            with open(image_path, 'rb') as f:
-                files = {'file': f}
-                
-                # Try tmpfiles.org first
-                try:
-                    response = requests.post('https://tmpfiles.org/api/v1/upload', files=files, timeout=30)
-                    if response.status_code == 200:
-                        result = response.json()
-                        if result.get('status') == 'success':
-                            # Extract the direct download URL
-                            upload_url = result['data']['url']
-                            # Convert to direct download URL format
-                            direct_url = upload_url.replace('tmpfiles.org/', 'tmpfiles.org/dl/')
-                            logger.info(f"Successfully uploaded to tmpfiles.org: {direct_url}")
-                            return direct_url
-                except Exception as e:
-                    logger.warning(f"tmpfiles.org upload failed: {e}")
-                
-                # Fallback to 0x0.st
-                try:
-                    f.seek(0)  # Reset file pointer
-                    files = {'file': f}
-                    response = requests.post('https://0x0.st', files=files, timeout=30)
-                    if response.status_code == 200:
-                        url = response.text.strip()
-                        logger.info(f"Successfully uploaded to 0x0.st: {url}")
-                        return url
-                except Exception as e:
-                    logger.warning(f"0x0.st upload failed: {e}")
-                
-                # Fallback to transfer.sh
-                try:
-                    f.seek(0)  # Reset file pointer
-                    files = {'file': f}
-                    response = requests.post('https://transfer.sh', files=files, timeout=30)
-                    if response.status_code == 200:
-                        url = response.text.strip()
-                        logger.info(f"Successfully uploaded to transfer.sh: {url}")
-                        return url
-                except Exception as e:
-                    logger.warning(f"transfer.sh upload failed: {e}")
-                
-                logger.error("All temporary hosting services failed")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error uploading image to temporary host: {e}")
             return None
     
     def get_chatgpt_prompt(self, image_path, replicate_api_key):
@@ -573,77 +528,86 @@ class StreamlitImageGenerator:
             st.error(f"Error getting GPT-5 prompt: {str(e)}")
             return None
     
-    def generate_seedream_image(self, prompt, selfie_path, replicate_api_key):
-        """Generate image using Seedream via Replicate API with temporary image hosting"""
-        try:
-            # Set Replicate API token
-            os.environ["REPLICATE_API_TOKEN"] = replicate_api_key
-            
-            logger.info("Uploading selfie to temporary hosting service...")
-            # Upload selfie to temporary hosting service
-            selfie_url = self.upload_image_to_temp_host(selfie_path)
-            
-            if not selfie_url:
-                logger.error("Failed to upload selfie to temporary hosting service")
-                # Fallback to text-to-image mode without reference image
-                logger.info("Falling back to text-to-image mode without reference image")
-                output = replicate.run(
-                    "bytedance/seedream-4",
-                    input={
-                        "prompt": prompt,
-                        "size": "2K",
-                        "width": 1024,
-                        "height": 1824,
-                        "aspect_ratio": "9:16",
-                        "max_images": 1,
-                        "sequential_image_generation": "disabled"
-                    }
-                )
-            else:
-                logger.info(f"Selfie uploaded successfully: {selfie_url}")
-                logger.info("Calling Replicate Seedream model with reference image...")
+    def generate_seedream_image(self, prompt, selfie_path):
+        """Generate image using Seedream API directly (not via Replicate)"""
+        session = self.get_session()
+        max_retries = 3
+        thread_name = threading.current_thread().name
+        
+        for attempt in range(max_retries):
+            try:
+                # Encode selfie image to base64
+                base64_image = self.encode_image_to_base64(selfie_path)
+                if not base64_image:
+                    logger.error(f"Failed to encode selfie to base64: {selfie_path}")
+                    return None
                 
-                # Use image-to-image generation with reference
-                output = replicate.run(
-                    "bytedance/seedream-4",
-                    input={
-                        "prompt": prompt,
-                        "size": "2K",
-                        "width": 1024,
-                        "height": 1824,
-                        "aspect_ratio": "9:16",
-                        "max_images": 1,
-                        "image_input": [selfie_url],  # Using the uploaded image URL
-                        "sequential_image_generation": "disabled"
-                    }
-                )
-            
-            if output and len(output) > 0:
-                # Check if output[0] is a string URL or has a url attribute/method
-                first_output = output[0]
+                # Prepare API request for Seedream
+                payload = {
+                    "model": "seedream-4-0-250828",
+                    "prompt": prompt,
+                    "image": base64_image,
+                    "size": "2304x4096",
+                    "sequential_image_generation": "disabled",
+                    "stream": False,
+                    "response_format": "url",
+                    "watermark": False
+                }
                 
-                if isinstance(first_output, str):
-                    # Output is directly a URL string
-                    image_url = first_output
-                elif hasattr(first_output, 'url'):
-                    # Output has url attribute (could be property or method)
-                    if callable(first_output.url):
-                        image_url = first_output.url()
-                    else:
-                        image_url = first_output.url
+                logger.debug(f"[{thread_name}] Generating Seedream image (Attempt {attempt + 1}/{max_retries})")
+                
+                # Make API request with longer timeout
+                response = session.post(
+                    SEEDREAM_API_URL, 
+                    json=payload, 
+                    timeout=(30, 180),  # (connection_timeout, read_timeout)
+                    stream=False
+                )
+                
+                if response.status_code != 200:
+                    logger.warning(f"[{thread_name}] Seedream API Error {response.status_code}")
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2
+                        time.sleep(wait_time)
+                        continue
+                    return None
+                
+                result = response.json()
+                
+                if 'data' in result and len(result['data']) > 0:
+                    image_url = result['data'][0]['url']
+                    logger.info(f"[{thread_name}] Seedream image generated successfully: {image_url}")
+                    return image_url
                 else:
-                    # Try to convert to string
-                    image_url = str(first_output)
-                
-                logger.info(f"Seedream image generated successfully: {image_url}")
-                return image_url
-            else:
-                logger.error("No output received from Seedream API")
+                    logger.error(f"[{thread_name}] No image data in Seedream API response")
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2
+                        time.sleep(wait_time)
+                        continue
+                    return None
+                    
+            except requests.exceptions.SSLError as e:
+                logger.error(f"[{thread_name}] SSL Error (attempt {attempt + 1}): {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep((attempt + 1) * 3)
+                    continue
                 return None
-            
-        except Exception as e:
-            logger.error(f"Error generating Seedream image: {str(e)}")
-            return None
+                    
+            except requests.exceptions.ConnectionError as e:
+                logger.error(f"[{thread_name}] Connection Error (attempt {attempt + 1}): {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep((attempt + 1) * 3)
+                    continue
+                return None
+                    
+            except Exception as e:
+                logger.error(f"[{thread_name}] Unexpected error (attempt {attempt + 1}): {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep((attempt + 1) * 3)
+                    continue
+                return None
+        
+        return None
     
     def download_image(self, image_url):
         """Download image from URL"""
@@ -669,9 +633,9 @@ class StreamlitImageGenerator:
             
             logger.info(f"Filtered prompt generated for {image_path}: {prompt[:100]}...")
             
-            # Step 2: Generate image with Seedream via Replicate
+            # Step 2: Generate image with Seedream API directly
             logger.info(f"Generating Seedream image for {image_path}")
-            image_url = self.generate_seedream_image(prompt, selfie_path, replicate_api_key)
+            image_url = self.generate_seedream_image(prompt, selfie_path)
             if not image_url:
                 logger.error(f"Failed to generate image for {image_path}")
                 return None
@@ -862,52 +826,23 @@ class StreamlitImageGenerator:
         
         return results, csv_data
 
-def validate_api_configuration():
-    """Validate API configuration and show status"""
-    status_items = []
-    
-    # Check Replicate API key
-    replicate_valid = bool(REPLICATE_API_KEY and len(REPLICATE_API_KEY.strip()) > 10)
-    status_items.append(("Replicate API Key", "✅ Configured" if replicate_valid else "❌ Invalid/Missing"))
-    
-    # Check ComfyUI server URL
-    comfyui_valid = bool(COMFYUI_SERVER_URL and COMFYUI_SERVER_URL.startswith(('http://', 'https://')))
-    status_items.append(("ComfyUI Server", "✅ Configured" if comfyui_valid else "❌ Invalid/Missing"))
-    
-    return status_items, replicate_valid and comfyui_valid
-
 def main():
     st.title("🎭 Seedream + Face Swap Generator (Parallel Processing)")
     st.markdown("Generate Seedream images using filtered ChatGPT prompts, with optional face swapping and parallel processing")
     
+    # Check if secrets are available
+    try:
+        # Test if secrets are accessible
+        test_replicate_key = REPLICATE_API_KEY
+        test_ark_key = ARK_API_KEY
+        api_keys_configured = True
+    except Exception as e:
+        st.error("API keys not configured in Streamlit secrets. Please add REPLICATE_API_KEY and ARK_API_KEY to your secrets.")
+        api_keys_configured = False
+        return
+    
     # Sidebar for configuration
-    st.sidebar.header("Configuration Status")
-    
-    # API Configuration validation
-    config_status, all_configs_valid = validate_api_configuration()
-    
-    st.sidebar.subheader("🔑 API Configuration")
-    for item, status in config_status:
-        st.sidebar.text(f"{item}: {status}")
-    
-    if not all_configs_valid:
-        st.sidebar.warning("⚠️ Please configure all API settings in secrets")
-        with st.sidebar.expander("📖 How to Configure Secrets"):
-            st.markdown("""
-            **For Streamlit Cloud:**
-            1. Go to app settings → Secrets
-            2. Add configuration:
-            ```toml
-            [api_keys]
-            REPLICATE_API_KEY = "your_key_here"
-            
-            [servers]
-            COMFYUI_SERVER_URL = "your_server_url"
-            ```
-            
-            **For Local Development:**
-            Create `.streamlit/secrets.toml` with same format
-            """)
+    st.sidebar.header("Configuration")
     
     # Face swap configuration
     st.sidebar.header("Face Swap Settings")
@@ -916,6 +851,9 @@ def main():
         value=False,
         help="Swap faces in generated images with your selfie"
     )
+    
+    # Always define comfyui_server_url
+    comfyui_server_url = COMFYUI_SERVER_URL if enable_face_swap else None
     
     # File uploads
     st.sidebar.header("File Inputs")
@@ -958,7 +896,7 @@ def main():
         st.header("Instructions")
         
         workflow_steps = [
-            "**Configure API keys** in Streamlit secrets",
+            "**API keys are configured** in Streamlit secrets",
             "**Upload images** you want to process",
             "**Upload your selfie** that will be used as reference",
             "**Optionally enable face swapping** for more realistic results",
@@ -970,29 +908,27 @@ def main():
             The app will process images in parallel with 10 workers:
             1. Generate prompts from uploaded images using ChatGPT (GPT-5) via Replicate
             2. **Filter out facial expressions** from the generated prompts
-            3. **Upload your selfie** to a temporary hosting service to get a public URL
-            4. Use the filtered prompts with your selfie URL to create new images via Seedream (Replicate)
-            5. **Perform face swapping** to replace faces in generated images with your selfie
-            6. Generate random 32-character filenames for all outputs
-            7. Create a CSV file with all prompts and metadata
+            3. Use the filtered prompts with your selfie to create new images via **Seedream API directly**
+            4. **Perform face swapping** to replace faces in generated images with your selfie
+            5. Generate random 32-character filenames for all outputs
+            6. Create a CSV file with all prompts and metadata
             
             **Note**: Expressions like "smiling", "happy", "sad", etc. are automatically removed from prompts.
             **Performance**: Up to 10 images are processed simultaneously for faster results.
-            **Hosting**: Uses temporary hosting services (tmpfiles.org, 0x0.st, transfer.sh) for selfie uploads.
+            **API**: Uses Seedream API directly (not via Replicate) for image generation.
             """
         else:
             workflow_description = """
             The app will process images in parallel with 10 workers:
             1. Generate prompts from uploaded images using ChatGPT (GPT-5) via Replicate
             2. **Filter out facial expressions** from the generated prompts
-            3. **Upload your selfie** to a temporary hosting service to get a public URL
-            4. Use the filtered prompts with your selfie URL to create new images via Seedream (Replicate)
-            5. Generate random 32-character filenames for all outputs
-            6. Create a CSV file with all prompts and metadata
+            3. Use the filtered prompts with your selfie to create new images via **Seedream API directly**
+            4. Generate random 32-character filenames for all outputs
+            5. Create a CSV file with all prompts and metadata
             
             **Note**: Expressions like "smiling", "happy", "sad", etc. are automatically removed from prompts.
             **Performance**: Up to 10 images are processed simultaneously for faster results.
-            **Hosting**: Uses temporary hosting services (tmpfiles.org, 0x0.st, transfer.sh) for selfie uploads.
+            **API**: Uses Seedream API directly (not via Replicate) for image generation.
             """
         
         for i, step in enumerate(workflow_steps, 1):
@@ -1010,11 +946,15 @@ def main():
         st.info("""
         **⚡ Parallel Processing**: Uses 10 concurrent workers to process multiple images simultaneously, significantly reducing total processing time.
         """)
+        
+        # API info
+        st.info("""
+        **🔌 Direct Seedream API**: Uses Seedream API directly instead of via Replicate for faster and more reliable image generation.
+        """)
     
     with col2:
         st.header("Current Status")
         
-        # Validation checks
         # Check if images are available based on input method
         if input_method == "Upload individual images":
             has_images = bool(uploaded_images)
@@ -1026,7 +966,7 @@ def main():
         has_selfie = bool(selfie_file)
         
         checks = []
-        checks.append(("API Configuration", "✅" if all_configs_valid else "❌ Check sidebar"))
+        checks.append(("API Keys Configured", "✅" if api_keys_configured else "❌ Check secrets"))
         
         if input_method == "Upload individual images":
             checks.append(("Images Uploaded", f"✅ {image_info}" if has_images else "❌"))
@@ -1036,46 +976,34 @@ def main():
         checks.append(("Selfie Uploaded", "✅" if has_selfie else "❌"))
         checks.append(("Parallel Processing", "✅ 10 Workers"))
         checks.append(("Expression Filtering", "✅ Enabled"))
+        checks.append(("Seedream API", "✅ Direct API"))
         
         if enable_face_swap:
-            comfyui_configured = COMFYUI_SERVER_URL and COMFYUI_SERVER_URL.startswith(('http://', 'https://'))
-            checks.append(("ComfyUI Server", "✅" if comfyui_configured else "❌"))
+            checks.append(("ComfyUI Server", "✅" if COMFYUI_SERVER_URL else "❌"))
         
         for check_name, status in checks:
             st.text(f"{check_name}: {status}")
         
         if enable_face_swap:
             st.info("🎭 Face swap enabled - processing will take longer but results will be more realistic")
-        
-        if not all_configs_valid:
-            st.warning("⚠️ Please configure API keys in secrets before running")
     
     # Processing section
     st.header("Processing")
     
-    required_items = [all_configs_valid, has_images, selfie_file]
+    required_items = [api_keys_configured, uploaded_images, selfie_file]
     
     if st.button("🚀 Start Parallel Processing", type="primary", disabled=not all(required_items)):
         if not all(required_items):
-            st.error("Please provide all required inputs and configure API keys before starting.")
+            st.error("Please provide all required inputs before starting.")
             return
         
         # Create temporary directory for uploaded images
         with tempfile.TemporaryDirectory() as temp_dir:
-            # Handle different input methods
-            if input_method == "Upload individual images":
-                # Save uploaded images to temp directory
-                for uploaded_file in uploaded_images:
-                    file_path = Path(temp_dir) / uploaded_file.name
-                    with open(file_path, 'wb') as f:
-                        f.write(uploaded_file.getvalue())
-            else:
-                # Extract ZIP file
-                generator = StreamlitImageGenerator()
-                extracted_files = generator.extract_images_from_zip(uploaded_zip.getvalue(), temp_dir)
-                if not extracted_files:
-                    st.error("No valid images found in the ZIP file.")
-                    return
+            # Save uploaded images to temp directory
+            for uploaded_file in uploaded_images:
+                file_path = Path(temp_dir) / uploaded_file.name
+                with open(file_path, 'wb') as f:
+                    f.write(uploaded_file.getvalue())
             
             # Process images with parallel processing
             generator = StreamlitImageGenerator()
@@ -1084,15 +1012,15 @@ def main():
                 selfie_file, 
                 REPLICATE_API_KEY,
                 enable_face_swap,
-                COMFYUI_SERVER_URL if enable_face_swap else None
+                comfyui_server_url
             )
             
             if results:
                 success_message = f"Successfully processed {len(results)} images with parallel processing!"
                 if enable_face_swap:
-                    success_message += " (with face swapping and expression filtering)"
+                    success_message += " (with face swapping and expression filtering using direct Seedream API)"
                 else:
-                    success_message += " (with expression filtering)"
+                    success_message += " (with expression filtering using direct Seedream API)"
                 st.success(success_message)
                 
                 # Create downloadable files section
@@ -1108,13 +1036,14 @@ def main():
                     
                     # Enhanced CSV content with metadata
                     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    csv_header = f"# Seedream Image Generation Report (Parallel Processing)\n"
+                    csv_header = f"# Seedream Image Generation Report (Parallel Processing - Direct API)\n"
                     csv_header += f"# Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                     csv_header += f"# Total images processed: {len(results)}\n"
                     csv_header += f"# Face swap enabled: {enable_face_swap}\n"
                     csv_header += f"# Expression filtering: Enabled\n"
                     csv_header += f"# Parallel workers: 10\n"
                     csv_header += f"# Input method: {input_method}\n"
+                    csv_header += f"# Seedream API: Direct API (not via Replicate)\n"
                     csv_header += "#\n"
                     
                     csv_content = csv_header + csv_df.to_csv(index=False)
@@ -1140,37 +1069,39 @@ def main():
                             result['image_content']
                         )
                     
-                    # Add original images info
-                    original_info = "# Original Images Reference\n"
-                    for i, result in enumerate(results):
-                        original_info += f"{result['original_name']} -> {result['generated_filename']}\n"
-                    zip_file.writestr("original_reference.txt", original_info)
+                    # Add original images info (if individual uploads)
+                    if input_method == "Upload individual images" and uploaded_images:
+                        original_info = "# Original Images Reference\n"
+                        for i, result in enumerate(results):
+                            original_info += f"{result['original_name']} -> {result['generated_filename']}\n"
+                        zip_file.writestr("original_reference.txt", original_info)
                     
                     # Add CSV to ZIP
                     if csv_data:
                         zip_file.writestr("processing_report.csv", csv_content)
                     
                     # Add processing summary
-                    summary = f"Seedream Image Generation Summary (Parallel Processing)\n"
-                    summary += f"=======================================================\n\n"
+                    summary = f"Seedream Image Generation Summary (Parallel Processing - Direct API)\n"
+                    summary += f"================================================================\n\n"
                     summary += f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                     summary += f"Input method: {input_method}\n"
                     summary += f"Total images processed: {len(results)}\n"
                     summary += f"Face swap enabled: {enable_face_swap}\n"
                     summary += f"Expression filtering: Enabled\n"
                     summary += f"Parallel workers: 10\n"
-                    image_count = len(uploaded_images) if input_method == "Upload individual images" else "N/A (ZIP)"
-                    summary += f"Success rate: {len(results)} images processed\n\n"
+                    summary += f"Success rate: {(len(results)/len(uploaded_images)*100):.1f}%\n"
+                    summary += f"Seedream API: Direct API (not via Replicate)\n\n"
                     summary += "Features:\n"
                     summary += "- Automatic expression filtering from prompts\n"
                     summary += "- Parallel processing with 10 concurrent workers\n"
                     summary += "- Random 32-character filenames\n"
-                    summary += f"- Face swapping: {'Enabled' if enable_face_swap else 'Disabled'}\n"
-                    summary += "- Secure API key management via Streamlit secrets\n\n"
+                    summary += "- Direct Seedream API for faster generation\n"
+                    summary += f"- Face swapping: {'Enabled' if enable_face_swap else 'Disabled'}\n\n"
                     summary += "Files included:\n"
                     summary += "- generated_images/: All generated images\n"
                     summary += "- processing_report.csv: Detailed report with filtered prompts\n"
-                    summary += "- original_reference.txt: Mapping of original to generated filenames\n"
+                    if input_method == "Upload individual images":
+                        summary += "- original_reference.txt: Mapping of original to generated filenames\n"
                     
                     zip_file.writestr("README.txt", summary)
                 
@@ -1197,11 +1128,7 @@ def main():
                     st.metric("Images Processed", len(results))
                 
                 with col2:
-                    total_input = len(uploaded_images) if input_method == "Upload individual images" else "N/A"
-                    if isinstance(total_input, int):
-                        st.metric("Success Rate", f"{(len(results)/total_input*100):.1f}%")
-                    else:
-                        st.metric("Success Rate", "N/A")
+                    st.metric("Success Rate", f"{(len(results)/len(uploaded_images)*100):.1f}%")
                 
                 with col3:
                     st.metric("Parallel Workers", "10")
@@ -1219,8 +1146,8 @@ def main():
                 - **Parallel Processing**: 10 concurrent workers
                 - **Processing Time**: Completed at {datetime.now().strftime('%H:%M:%S')}
                 - **Output Format**: Random 32-character filenames
-                - **API Used**: Replicate GPT-5 for prompts, Replicate Seedream for generation
-                - **Security**: API keys managed via Streamlit secrets
+                - **Prompt API**: Replicate GPT-5 for prompt generation
+                - **Image API**: Direct Seedream API (not via Replicate)
                 """
                 
                 if enable_face_swap:
@@ -1229,11 +1156,11 @@ def main():
                 st.markdown(process_info)
             
             else:
-                st.error("No images were successfully processed. Please check your API configuration and try again.")
+                st.error("No images were successfully processed. Please check your API keys and try again.")
     
     # Footer
     st.markdown("---")
-    st.markdown("Made with Streamlit and Replicate APIs (GPT-5 + Seedream) | **Features**: Expression Filtering + Parallel Processing + Secure API Management")
+    st.markdown("Made with Streamlit, Replicate GPT-5, and Direct Seedream API | **Features**: Expression Filtering + Parallel Processing + Direct API")
     
     # Display current log file info
     if st.sidebar.button("View Log Info"):
