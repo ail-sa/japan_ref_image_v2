@@ -499,12 +499,9 @@ class StreamlitImageGenerator:
             
             logger.info("Image encoded to base64 successfully")
             
-            # Use Replicate's GPT-5-Pro model with streaming
-            logger.info("Calling Replicate GPT-5-Pro model...")
-            
-            # Collect streaming output
-            result = ""
-            for event in replicate.stream(
+            # Use Replicate's GPT-5-pro model
+            logger.info("Calling Replicate GPT-5-pro model...")
+            output = replicate.run(
                 "openai/gpt-5-pro",
                 input={
                     "prompt": "i want to generate this image on seedream, what should be the prompt. you cannot describe the body of the person or the hair. the expression should also be mentioned - this is mandatory, always describe the facial expression (happy, sad, serious, smiling, etc.). the gender can be present too. Only 1 person should be in focus",
@@ -512,7 +509,11 @@ class StreamlitImageGenerator:
                     "verbosity": "medium",
                     "image_input": [base64_image]
                 }
-            ):
+            )
+            
+            # Collect streaming output
+            result = ""
+            for event in output:
                 result += str(event)
             
             # Filter out expressions from the final prompt
