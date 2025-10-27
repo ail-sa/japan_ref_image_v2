@@ -484,7 +484,7 @@ class StreamlitImageGenerator:
             return None
     
     def get_chatgpt_prompt(self, image_path, replicate_api_key):
-        """Get Seedream-friendly prompt from GPT-5-Pro via Replicate"""
+        """Get Seedream-friendly prompt from GPT-5-nano via Replicate"""
         logger.info(f"Getting prompt for image: {image_path}")
         try:
             # Set Replicate API token
@@ -499,32 +499,32 @@ class StreamlitImageGenerator:
             
             logger.info("Image encoded to base64 successfully")
             
-            # Use Replicate's GPT-5-pro model
-            logger.info("Calling Replicate GPT-5-pro model...")
-            output = replicate.run(
-                "openai/gpt-5-pro",
+            # Use Replicate's GPT-5-nano model with streaming
+            logger.info("Calling Replicate GPT-5-nano model...")
+            
+            # Collect streaming output
+            result = ""
+            for event in replicate.stream(
+                "openai/gpt-5-nano",
                 input={
                     "prompt": "i want to generate this image on seedream, what should be the prompt. you cannot describe the body of the person or the hair. the expression should also be mentioned - this is mandatory, always describe the facial expression (happy, sad, serious, smiling, etc.). the gender can be present too. Only 1 person should be in focus",
                     "messages": [],
                     "verbosity": "medium",
-                    "image_input": [base64_image]
+                    "image_input": [base64_image],
+                    "reasoning_effort": "minimal"
                 }
-            )
-            
-            # Collect streaming output
-            result = ""
-            for event in output:
+            ):
                 result += str(event)
             
             # Filter out expressions from the final prompt
             filtered_result = self.expression_filter.filter_expressions(result.strip())
             
-            logger.info(f"GPT-5-Pro prompt generated and filtered successfully: {filtered_result[:100]}...")
+            logger.info(f"GPT-5-nano prompt generated and filtered successfully: {filtered_result[:100]}...")
             return filtered_result
             
         except Exception as e:
-            logger.error(f"Error getting GPT-5-Pro prompt for {image_path}: {str(e)}")
-            st.error(f"Error getting GPT-5-Pro prompt: {str(e)}")
+            logger.error(f"Error getting GPT-5-nano prompt for {image_path}: {str(e)}")
+            st.error(f"Error getting GPT-5-nano prompt: {str(e)}")
             return None
     
     def generate_seedream_image(self, prompt, selfie_path):
@@ -624,7 +624,7 @@ class StreamlitImageGenerator:
             logger.info(f"Processing single image: {image_path}")
             
             # Step 1: Get ChatGPT prompt
-            logger.info(f"Getting GPT-5-Pro prompt for {image_path}")
+            logger.info(f"Getting GPT-5-nano prompt for {image_path}")
             prompt = self.get_chatgpt_prompt(str(image_path), replicate_api_key)
             if not prompt:
                 logger.error(f"Failed to get prompt for {image_path}")
@@ -905,7 +905,7 @@ def main():
         if enable_face_swap:
             workflow_description = """
             The app will process images in parallel with 10 workers:
-            1. Generate prompts from uploaded images using ChatGPT (GPT-5-Pro) via Replicate
+            1. Generate prompts from uploaded images using ChatGPT (GPT-5-nano) via Replicate
             2. **Filter out facial expressions** from the generated prompts
             3. Use the filtered prompts with your selfie to create new images via **Seedream API directly**
             4. **Perform face swapping** to replace faces in generated images with your selfie
@@ -919,7 +919,7 @@ def main():
         else:
             workflow_description = """
             The app will process images in parallel with 10 workers:
-            1. Generate prompts from uploaded images using ChatGPT (GPT-5-Pro) via Replicate
+            1. Generate prompts from uploaded images using ChatGPT (GPT-5-nano) via Replicate
             2. **Filter out facial expressions** from the generated prompts
             3. Use the filtered prompts with your selfie to create new images via **Seedream API directly**
             4. Generate random 32-character filenames for all outputs
@@ -1145,7 +1145,7 @@ def main():
                 - **Parallel Processing**: 10 concurrent workers
                 - **Processing Time**: Completed at {datetime.now().strftime('%H:%M:%S')}
                 - **Output Format**: Random 32-character filenames
-                - **Prompt API**: Replicate GPT-5-Pro for prompt generation
+                - **Prompt API**: Replicate GPT-5-nano for prompt generation
                 - **Image API**: Direct Seedream API (not via Replicate)
                 """
                 
@@ -1159,7 +1159,7 @@ def main():
     
     # Footer
     st.markdown("---")
-    st.markdown("Made with Streamlit, Replicate GPT-5-Pro, and Direct Seedream API | **Features**: Expression Filtering + Parallel Processing + Direct API")
+    st.markdown("Made with Streamlit, Replicate GPT-5-nano, and Direct Seedream API | **Features**: Expression Filtering + Parallel Processing + Direct API")
     
     # Display current log file info
     if st.sidebar.button("View Log Info"):
