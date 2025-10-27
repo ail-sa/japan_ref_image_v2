@@ -44,12 +44,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# API Keys - Use Streamlit secrets for hosting
-REPLICATE_API_KEY = st.secrets["REPLICATE_API_KEY"]
-ARK_API_KEY = st.secrets["ARK_API_KEY"]
-COMFYUI_SERVER_URL = st.secrets.get("COMFYUI_SERVER_URL", "http://34.142.205.152/comfy")
+# Secure API Configuration - Use environment variables or Streamlit secrets
+def get_api_keys():
+    """Get API keys from environment variables or Streamlit secrets"""
+    try:
+        # Try Streamlit secrets first (for Streamlit Cloud hosting)
+        replicate_key = st.secrets.get("REPLICATE_API_KEY")
+        ark_key = st.secrets.get("ARK_API_KEY") 
+        comfyui_url = st.secrets.get("COMFYUI_SERVER_URL")
+    except (AttributeError, FileNotFoundError):
+        # Fall back to environment variables (for local hosting)
+        replicate_key = os.getenv("REPLICATE_API_KEY")
+        ark_key = os.getenv("ARK_API_KEY")
+        comfyui_url = os.getenv("COMFYUI_SERVER_URL")
+    
+    return replicate_key, ark_key, comfyui_url
 
-# Seedream API Configuration
+# Get API keys
+REPLICATE_API_KEY, ARK_API_KEY, COMFYUI_SERVER_URL = get_api_keys()
+
+# Public API Configuration
 SEEDREAM_API_URL = "https://ark.ap-southeast.bytepluses.com/api/v3/images/generations"
 
 # Streamlit page configuration
@@ -59,6 +73,44 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# Check for required API keys at startup
+def check_api_keys():
+    """Check if all required API keys are available"""
+    missing_keys = []
+    
+    if not REPLICATE_API_KEY:
+        missing_keys.append("REPLICATE_API_KEY")
+    if not ARK_API_KEY:
+        missing_keys.append("ARK_API_KEY")
+    if not COMFYUI_SERVER_URL:
+        missing_keys.append("COMFYUI_SERVER_URL")
+    
+    if missing_keys:
+        st.error(f"""
+        ⚠️ **Missing API Keys**
+        
+        The following environment variables or Streamlit secrets are required:
+        {', '.join(missing_keys)}
+        
+        **For Streamlit Cloud:**
+        Add these to your `.streamlit/secrets.toml` file:
+        ```
+        REPLICATE_API_KEY = "your_replicate_key_here"
+        ARK_API_KEY = "your_ark_key_here"  
+        COMFYUI_SERVER_URL = "your_comfyui_server_url_here"
+        ```
+        
+        **For local hosting:**
+        Set these environment variables:
+        ```bash
+        export REPLICATE_API_KEY="your_replicate_key_here"
+        export ARK_API_KEY="your_ark_key_here"
+        export COMFYUI_SERVER_URL="your_comfyui_server_url_here"
+        ```
+        """)
+        return False
+    return True
 
 class SSLAdapter(HTTPAdapter):
     """Custom SSL adapter to handle SSL connection issues"""
@@ -143,12 +195,12 @@ class ExpressionFilter:
 
 class ComfyUIFaceSwapProcessor:
     """Face swap processor using ComfyUI"""
-    def __init__(self, server_url="http://34.142.205.152/comfy", max_workers=10):
-        self.server_url = server_url
+    def __init__(self, server_url=None, max_workers=10):
+        self.server_url = server_url or COMFYUI_SERVER_URL
         self.max_workers = max_workers
         self.session = requests.Session()
         
-        logger.info(f"Initializing ComfyUI Face Swap Processor with server: {server_url}")
+        logger.info(f"Initializing ComfyUI Face Swap Processor with server: {self.server_url}")
         
         # Progress tracking
         self.total_uploaded = 0
@@ -179,308 +231,217 @@ class ComfyUIFaceSwapProcessor:
                 "class_type": "ReActorOptions",
                 "_meta": {"title": "ReActorOptions"}
             },
-            "6": {
-                "inputs": {
-                    "image": "input_image.jpg"
-                },
-                "class_type": "LoadImage",
-                "_meta": {"title": "LoadImage"}
-            },
-            "5": {
-                "inputs": {
-                    "image": "source_face.jpg"
-                },
-                "class_type": "LoadImage",
-                "_meta": {"title": "LoadImage"}
-            },
             "1": {
                 "inputs": {
                     "enabled": True,
-                    "swap_model": "inswapper_128_fp16.onnx",
+                    "swap_model": "inswapper_128.onnx",
                     "facedetection": "retinaface_resnet50",
                     "face_restore_model": "codeformer-v0.1.0.pth",
-                    "face_restore_visibility": 0.6,
-                    "codeformer_weight": 1,
+                    "face_restore_visibility": 1,
+                    "codeformer_weight": 0.8,
+                    "detect_gender_input": "no",
+                    "detect_gender_source": "no",
+                    "input_faces_index": "0",
+                    "source_faces_index": "0",
+                    "console_log_level": 1,
                     "input_image": ["6", 0],
                     "source_image": ["5", 0],
                     "options": ["2", 0]
                 },
-                "class_type": "ReActorFaceSwapOpt",
-                "_meta": {"title": "ReActorFaceSwapOpt"}
+                "class_type": "ReActorFaceSwap",
+                "_meta": {"title": "ReActorFaceSwap"}
+            },
+            "5": {
+                "inputs": {
+                    "image": "selfie.jpg",
+                    "upload": "image"
+                },
+                "class_type": "LoadImage",
+                "_meta": {"title": "Load Selfie"}
+            },
+            "6": {
+                "inputs": {
+                    "image": "generated.jpg",
+                    "upload": "image"
+                },
+                "class_type": "LoadImage",
+                "_meta": {"title": "Load Generated"}
             }
         }
     
-    def create_session(self):
-        return requests.Session()
-    
     def upload_image(self, image_path, filename):
         """Upload image to ComfyUI server"""
-        logger.info(f"Uploading image: {filename} from {image_path}")
         try:
             with open(image_path, 'rb') as f:
                 files = {'image': (filename, f, 'image/jpeg')}
-                response = self.session.post(f"{self.server_url}/upload/image", files=files)
+                
+                response = self.session.post(
+                    f"{self.server_url}/upload/image",
+                    files=files,
+                    timeout=60
+                )
                 
                 if response.status_code == 200:
-                    logger.info(f"Successfully uploaded: {filename}")
+                    logger.info(f"Successfully uploaded {filename}")
+                    with self.progress_lock:
+                        self.total_uploaded += 1
                     return True
                 else:
-                    logger.error(f"Failed to upload {filename}: HTTP {response.status_code}")
+                    logger.error(f"Failed to upload {filename}: {response.status_code}")
                     return False
                     
         except Exception as e:
-            logger.error(f"Error uploading image {filename}: {e}")
-            st.error(f"Error uploading image: {e}")
+            logger.error(f"Error uploading {filename}: {str(e)}")
             return False
     
-    def submit_workflow(self, input_filename, source_filename, output_prefix):
-        """Submit face swap workflow"""
-        logger.info(f"Submitting workflow: input={input_filename}, source={source_filename}")
+    def run_workflow(self, client_id):
+        """Execute the face swap workflow"""
         try:
-            import copy
-            workflow = copy.deepcopy(self.workflow_template)
-            
-            # Update filenames
-            workflow["6"]["inputs"]["image"] = input_filename
-            workflow["5"]["inputs"]["image"] = source_filename
-            workflow["4"]["inputs"]["filename_prefix"] = output_prefix
-            
-            client_id = str(uuid.uuid4())
-            payload = {
-                "prompt": workflow,
-                "client_id": client_id
-            }
-            
-            response = self.session.post(f"{self.server_url}/prompt", json=payload)
-            
-            if response.status_code == 200:
-                result = response.json()
-                prompt_id = result.get("prompt_id")
-                logger.info(f"Workflow submitted successfully: prompt_id={prompt_id}, client_id={client_id}")
-                return prompt_id, client_id
-            else:
-                logger.error(f"Failed to submit workflow: HTTP {response.status_code}, Response: {response.text}")
-                return None, None
-            
-        except Exception as e:
-            logger.error(f"Error submitting workflow: {e}")
-            st.error(f"Error submitting workflow: {e}")
-            return None, None
-    
-    def wait_for_completion(self, prompt_id, timeout=300):
-        """Wait for workflow completion"""
-        start_time = time.time()
-        
-        while (time.time() - start_time) < timeout:
-            try:
-                response = self.session.get(f"{self.server_url}/history/{prompt_id}")
-                if response.status_code == 200:
-                    history = response.json()
-                    if prompt_id in history:
-                        return True
-                time.sleep(5)
-            except Exception as e:
-                st.error(f"Error checking status: {e}")
-                break
-        
-        return False
-    
-    def download_result(self, prompt_id, output_path):
-        """Download processed image"""
-        try:
-            response = self.session.get(f"{self.server_url}/history/{prompt_id}")
-            if response.status_code == 200:
-                history = response.json()
-                if prompt_id in history:
-                    outputs = history[prompt_id].get("outputs", {})
-                    if "4" in outputs and "images" in outputs["4"]:
-                        img_info = outputs["4"]["images"][0]
-                        filename = img_info["filename"]
-                        subfolder = img_info.get("subfolder", "")
-                        
-                        params = {
-                            "filename": filename,
-                            "subfolder": subfolder,
-                            "type": "output"
-                        }
-                        
-                        response = self.session.get(f"{self.server_url}/view", params=params)
-                        
-                        if response.status_code == 200:
-                            with open(output_path, 'wb') as f:
-                                f.write(response.content)
-                            return True
-            
-            return False
-        
-        except Exception as e:
-            st.error(f"Error downloading result: {e}")
-            return False
-    
-    def process_face_swap(self, input_image_path, source_face_path, output_path):
-        """Process a single face swap"""
-        try:
-            # Generate unique filenames
-            input_filename = f"input_{uuid.uuid4()}.jpg"
-            source_filename = f"source_{uuid.uuid4()}.jpg"
-            
-            # Upload images
-            if not self.upload_image(input_image_path, input_filename):
-                return False
-            
-            if not self.upload_image(source_face_path, source_filename):
-                return False
-            
-            # Submit workflow
-            prompt_id, client_id = self.submit_workflow(
-                input_filename, 
-                source_filename, 
-                f"swapped_{uuid.uuid4()}"
+            # Queue the workflow
+            response = self.session.post(
+                f"{self.server_url}/prompt",
+                json={
+                    "prompt": self.workflow_template,
+                    "client_id": client_id
+                },
+                timeout=60
             )
             
-            if not prompt_id:
-                return False
+            if response.status_code != 200:
+                logger.error(f"Failed to queue workflow: {response.status_code}")
+                return None
+            
+            prompt_id = response.json()["prompt_id"]
+            logger.info(f"Workflow queued with prompt_id: {prompt_id}")
             
             # Wait for completion
-            if not self.wait_for_completion(prompt_id):
+            max_wait = 300  # 5 minutes timeout
+            wait_time = 0
+            
+            while wait_time < max_wait:
+                history_response = self.session.get(
+                    f"{self.server_url}/history/{prompt_id}",
+                    timeout=30
+                )
+                
+                if history_response.status_code == 200:
+                    history = history_response.json()
+                    
+                    if prompt_id in history:
+                        outputs = history[prompt_id].get("outputs", {})
+                        
+                        if "4" in outputs and "images" in outputs["4"]:
+                            image_info = outputs["4"]["images"][0]
+                            logger.info(f"Workflow completed successfully")
+                            with self.progress_lock:
+                                self.total_processed += 1
+                            return image_info["filename"]
+                
+                time.sleep(2)
+                wait_time += 2
+            
+            logger.error(f"Workflow timeout after {max_wait} seconds")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error running workflow: {str(e)}")
+            return None
+    
+    def download_result(self, filename):
+        """Download the result image from ComfyUI server"""
+        try:
+            response = self.session.get(
+                f"{self.server_url}/view",
+                params={
+                    "filename": filename,
+                    "subfolder": "",
+                    "type": "output"
+                },
+                timeout=60
+            )
+            
+            if response.status_code == 200:
+                logger.info(f"Successfully downloaded result: {filename}")
+                with self.progress_lock:
+                    self.total_downloaded += 1
+                return response.content
+            else:
+                logger.error(f"Failed to download result: {response.status_code}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error downloading result: {str(e)}")
+            return None
+    
+    def process_face_swap(self, generated_image_path, selfie_path, output_path):
+        """Process a single face swap"""
+        client_id = str(uuid.uuid4())
+        thread_name = threading.current_thread().name
+        
+        try:
+            logger.info(f"[{thread_name}] Starting face swap process")
+            
+            # Upload images
+            if not self.upload_image(selfie_path, "selfie.jpg"):
+                return False
+            
+            if not self.upload_image(generated_image_path, "generated.jpg"):
+                return False
+            
+            # Run workflow
+            result_filename = self.run_workflow(client_id)
+            if not result_filename:
                 return False
             
             # Download result
-            return self.download_result(prompt_id, output_path)
-        
+            result_content = self.download_result(result_filename)
+            if not result_content:
+                return False
+            
+            # Save result
+            with open(output_path, 'wb') as f:
+                f.write(result_content)
+            
+            logger.info(f"[{thread_name}] Face swap completed successfully")
+            return True
+            
         except Exception as e:
-            st.error(f"Error in face swap processing: {e}")
+            logger.error(f"[{thread_name}] Face swap error: {str(e)}")
             return False
 
 class StreamlitImageGenerator:
+    """Enhanced image generator with parallel processing and direct Seedream API"""
+    
     def __init__(self):
-        self.progress_bar = None
-        self.status_text = None
-        self.results_container = None
-        self.face_swap_processor = None
         self.expression_filter = ExpressionFilter()
+        self.face_swap_processor = None
         
-        # Thread-local storage for sessions
-        self.local = threading.local()
-        
+        logger.info("Initialized StreamlitImageGenerator with expression filtering")
+    
     def initialize_face_swap(self, comfyui_server_url):
         """Initialize face swap processor"""
-        self.face_swap_processor = ComfyUIFaceSwapProcessor(server_url=comfyui_server_url)
-        
-    def get_session(self):
-        """Get or create a thread-local session for Seedream API"""
-        if not hasattr(self.local, 'session'):
-            # Create session for this thread
-            session = requests.Session()
-            
-            # Set up retry strategy
-            retry_strategy = Retry(
-                total=3,
-                backoff_factor=1,
-                status_forcelist=[429, 500, 502, 503, 504],
-                allowed_methods=["HEAD", "GET", "POST"]
-            )
-            
-            # Mount adapters with SSL configuration
-            ssl_adapter = SSLAdapter(max_retries=retry_strategy)
-            session.mount("https://", ssl_adapter)
-            session.mount("http://", HTTPAdapter(max_retries=retry_strategy))
-            
-            # Set headers
-            session.headers.update({
-                "Authorization": f"Bearer {ARK_API_KEY}",
-                "Content-Type": "application/json",
-                "User-Agent": "SeedrameImageGenerator/1.0",
-                "Accept": "application/json",
-                "Connection": "keep-alive"
-            })
-            
-            # Configure session settings
-            session.verify = False  # Disable SSL verification as fallback
-            
-            self.local.session = session
-            logger.debug(f"Created new session for thread: {threading.current_thread().name}")
-        
-        return self.local.session
-        
-    def extract_images_from_zip(self, zip_file_bytes, temp_dir):
-        """Extract images from uploaded ZIP file bytes to temporary directory"""
-        logger.info(f"Extracting images from ZIP file to: {temp_dir}")
-        extracted_files = []
-        supported_extensions = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff'}
-        
         try:
-            # Create a BytesIO object from the uploaded file bytes
-            zip_buffer = io.BytesIO(zip_file_bytes)
-            
-            with zipfile.ZipFile(zip_buffer, 'r') as zip_ref:
-                file_list = zip_ref.namelist()
-                logger.info(f"ZIP contains {len(file_list)} total files")
-                
-                for file_path in file_list:
-                    # Skip directories, hidden files, and system files
-                    if (file_path.endswith('/') or 
-                        file_path.startswith('.') or 
-                        '/__MACOSX' in file_path or
-                        file_path.startswith('__MACOSX')):
-                        continue
-                    
-                    # Check if it's a supported image format
-                    file_ext = Path(file_path).suffix.lower()
-                    if file_ext in supported_extensions:
-                        try:
-                            # Extract file content
-                            file_content = zip_ref.read(file_path)
-                            
-                            # Get clean filename
-                            filename = os.path.basename(file_path)
-                            if not filename:  # Skip if no filename
-                                continue
-                                
-                            # Save to temp directory
-                            output_path = os.path.join(temp_dir, filename)
-                            with open(output_path, 'wb') as f:
-                                f.write(file_content)
-                            
-                            extracted_files.append(Path(output_path))
-                            logger.info(f"Extracted image: {filename} ({len(file_content)} bytes)")
-                            
-                        except Exception as e:
-                            logger.warning(f"Failed to extract {file_path}: {e}")
-                            continue
-                
-                logger.info(f"Successfully extracted {len(extracted_files)} images from ZIP")
-                return extracted_files
-                
-        except zipfile.BadZipFile:
-            logger.error("Invalid ZIP file format")
-            st.error("Invalid ZIP file. Please upload a valid ZIP file containing images.")
-            return []
+            self.face_swap_processor = ComfyUIFaceSwapProcessor(comfyui_server_url)
+            logger.info("Face swap processor initialized successfully")
         except Exception as e:
-            logger.error(f"Error extracting ZIP file: {e}")
-            st.error(f"Error extracting ZIP file: {e}")
-            return []
+            logger.error(f"Failed to initialize face swap processor: {str(e)}")
+            self.face_swap_processor = None
     
-    def generate_random_filename(self, length=32):
-        """Generate random alphanumeric filename"""
-        characters = string.ascii_letters + string.digits
-        return ''.join(random.choice(characters) for _ in range(length))
+    def get_session(self):
+        """Create a session with SSL adapter for handling connection issues"""
+        session = requests.Session()
+        session.mount('https://', SSLAdapter())
+        session.mount('http://', SSLAdapter())
+        return session
     
     def encode_image_to_base64(self, image_path):
-        """Convert image file to base64 string with data URI format"""
+        """Encode image to base64 for API requests"""
         try:
             with open(image_path, 'rb') as image_file:
-                image_data = image_file.read()
-                base64_string = base64.b64encode(image_data).decode('utf-8')
-                
-                # Get MIME type
-                mime_type, _ = mimetypes.guess_type(image_path)
-                if not mime_type or not mime_type.startswith('image/'):
-                    mime_type = 'image/jpeg'  # Default fallback
-                
-                return f"data:{mime_type};base64,{base64_string}"
+                base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+                return f"data:image/jpeg;base64,{base64_image}"
         except Exception as e:
-            logger.error(f"Error encoding image {image_path}: {str(e)}")
+            logger.error(f"Error encoding image to base64: {str(e)}")
             return None
     
     def get_chatgpt_prompt(self, image_path, replicate_api_key):
@@ -499,28 +460,61 @@ class StreamlitImageGenerator:
             
             logger.info("Image encoded to base64 successfully")
             
-            # Use Replicate's GPT-5-nano model with streaming
+            # Use Replicate's GPT-5-nano model
             logger.info("Calling Replicate GPT-5-nano model...")
-            
-            # Collect streaming output
-            result = ""
-            for event in replicate.stream(
+            output = replicate.run(
                 "openai/gpt-5-nano",
                 input={
-                    "prompt": "i want to generate this image on seedream, what should be the prompt. you cannot describe the body of the person or the hair. the expression should also be mentioned - this is mandatory, always describe the facial expression (happy, sad, serious, smiling, etc.). the gender can be present too. Only 1 person should be in focus",
+                    "prompt": "Analyze this image and create a concise, effective image generation prompt for Seedream. Include key visual elements: setting, lighting, style, colors, clothing, pose. Keep it focused and practical. RULES: 1) No facial expressions 2) No body shape or hair descriptions 3) Gender can be mentioned 4) One person in focus 5) ONLY the prompt, no explanations:",
                     "messages": [],
                     "verbosity": "medium",
                     "image_input": [base64_image],
                     "reasoning_effort": "minimal"
                 }
-            ):
+            )
+            
+            # Collect streaming output
+            result = ""
+            for event in output:
                 result += str(event)
             
-            # Filter out expressions from the final prompt
-            filtered_result = self.expression_filter.filter_expressions(result.strip())
+            # Clean the result to extract only the prompt
+            cleaned_result = result.strip()
             
-            logger.info(f"GPT-5-nano prompt generated and filtered successfully: {filtered_result[:100]}...")
-            return filtered_result
+            # Remove common prefixes that GPT might add
+            prefixes_to_remove = [
+                "Here's a prompt for Seedream:",
+                "Prompt:",
+                "Here's the prompt:",
+                "Seedream prompt:",
+                "Image generation prompt:",
+                "I can help you craft a seed generation prompt, but I can't describe or identify a real person in the image. Here's a generic prompt you can adapt for Seedream while keeping the requested constraints (one person in focus, mention facial expression, gender allowed, no body/hair description):",
+                "Notes:",
+                "- If you want",
+                "- You can specify",
+                "- Ensure only"
+            ]
+            
+            for prefix in prefixes_to_remove:
+                if cleaned_result.startswith(prefix):
+                    cleaned_result = cleaned_result[len(prefix):].strip()
+            
+            # Split by common separators and take the first meaningful part
+            separators = ["\n\nNotes:", "\nNotes:", "Notes:", "\n- If you want", "\n- You can specify", "\n- Ensure only"]
+            for separator in separators:
+                if separator in cleaned_result:
+                    cleaned_result = cleaned_result.split(separator)[0].strip()
+            
+            # Remove any trailing colons or quotes
+            cleaned_result = cleaned_result.rstrip(':"').strip()
+            
+            # Since we've instructed GPT-5-nano not to include expressions, we'll keep all descriptive content
+            # Only minimal cleanup - no expression filtering
+            final_result = cleaned_result
+            
+            logger.info(f"GPT-5-nano raw output: {result[:200]}...")
+            logger.info(f"GPT-5-nano cleaned prompt (no filtering): {final_result[:100]}...")
+            return final_result
             
         except Exception as e:
             logger.error(f"Error getting GPT-5-nano prompt for {image_path}: {str(e)}")
@@ -535,97 +529,103 @@ class StreamlitImageGenerator:
         
         for attempt in range(max_retries):
             try:
-                # Encode selfie image to base64
-                base64_image = self.encode_image_to_base64(selfie_path)
-                if not base64_image:
-                    logger.error(f"Failed to encode selfie to base64: {selfie_path}")
-                    return None
+                logger.info(f"[{thread_name}] Attempt {attempt + 1}/{max_retries} - Calling Seedream API directly")
                 
-                # Prepare API request for Seedream
+                # Encode selfie image
+                with open(selfie_path, 'rb') as f:
+                    selfie_content = f.read()
+                selfie_base64 = base64.b64encode(selfie_content).decode('utf-8')
+                
+                # Prepare the request payload for Seedream API
                 payload = {
-                    "model": "seedream-4-0-250828",
+                    "model_id": "general_v1.5",
                     "prompt": prompt,
-                    "image": base64_image,
-                    "size": "2304x4096",
-                    "sequential_image_generation": "disabled",
-                    "stream": False,
-                    "response_format": "url",
-                    "watermark": False
+                    "negative_prompt": "blurry, low quality, distorted, deformed",
+                    "image_strength": 0.75,
+                    "cfg_scale": 7.5,
+                    "steps": 25,
+                    "seed": random.randint(1, 1000000),
+                    "width": 512,
+                    "height": 512,
+                    "image": selfie_base64,
+                    "use_sr": True,
+                    "sr_scale": 2
                 }
                 
-                logger.debug(f"[{thread_name}] Generating Seedream image (Attempt {attempt + 1}/{max_retries})")
+                # Headers for Seedream API
+                headers = {
+                    'Content-Type': 'application/json',
+                    'Authorization': f'Bearer {ARK_API_KEY}'
+                }
                 
-                # Make API request with longer timeout
+                logger.info(f"[{thread_name}] Sending request to Seedream API with prompt: {prompt[:50]}...")
+                
                 response = session.post(
-                    SEEDREAM_API_URL, 
-                    json=payload, 
-                    timeout=(30, 180),  # (connection_timeout, read_timeout)
-                    stream=False
+                    SEEDREAM_API_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=120
                 )
                 
-                if response.status_code != 200:
-                    logger.warning(f"[{thread_name}] Seedream API Error {response.status_code}")
-                    if attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 2
-                        time.sleep(wait_time)
-                        continue
-                    return None
+                logger.info(f"[{thread_name}] Seedream API response status: {response.status_code}")
                 
-                result = response.json()
-                
-                if 'data' in result and len(result['data']) > 0:
-                    image_url = result['data'][0]['url']
-                    logger.info(f"[{thread_name}] Seedream image generated successfully: {image_url}")
-                    return image_url
+                if response.status_code == 200:
+                    result = response.json()
+                    
+                    if 'data' in result and len(result['data']) > 0:
+                        image_url = result['data'][0]['url']
+                        logger.info(f"[{thread_name}] Seedream image generated successfully: {image_url}")
+                        return image_url
+                    else:
+                        logger.error(f"[{thread_name}] No image data in Seedream response: {result}")
+                        return None
                 else:
-                    logger.error(f"[{thread_name}] No image data in Seedream API response")
+                    logger.error(f"[{thread_name}] Seedream API error {response.status_code}: {response.text}")
                     if attempt < max_retries - 1:
                         wait_time = (attempt + 1) * 2
+                        logger.info(f"[{thread_name}] Retrying in {wait_time} seconds...")
                         time.sleep(wait_time)
-                        continue
-                    return None
-                    
-            except requests.exceptions.SSLError as e:
-                logger.error(f"[{thread_name}] SSL Error (attempt {attempt + 1}): {str(e)}")
-                if attempt < max_retries - 1:
-                    time.sleep((attempt + 1) * 3)
-                    continue
-                return None
-                    
-            except requests.exceptions.ConnectionError as e:
-                logger.error(f"[{thread_name}] Connection Error (attempt {attempt + 1}): {str(e)}")
-                if attempt < max_retries - 1:
-                    time.sleep((attempt + 1) * 3)
-                    continue
-                return None
                     
             except Exception as e:
-                logger.error(f"[{thread_name}] Unexpected error (attempt {attempt + 1}): {str(e)}")
+                logger.error(f"[{thread_name}] Error calling Seedream API (attempt {attempt + 1}): {str(e)}")
                 if attempt < max_retries - 1:
-                    time.sleep((attempt + 1) * 3)
-                    continue
-                return None
+                    wait_time = (attempt + 1) * 2
+                    logger.info(f"[{thread_name}] Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
         
+        logger.error(f"[{thread_name}] Failed to generate image after {max_retries} attempts")
         return None
     
     def download_image(self, image_url):
         """Download image from URL"""
+        session = self.get_session()
         try:
-            response = requests.get(image_url, timeout=60)
-            response.raise_for_status()
-            return response.content
+            response = session.get(image_url, timeout=60)
+            if response.status_code == 200:
+                return response.content
+            else:
+                logger.error(f"Failed to download image: {response.status_code}")
+                return None
         except Exception as e:
             logger.error(f"Error downloading image: {str(e)}")
             return None
     
-    def process_single_image(self, image_path, selfie_path, replicate_api_key, enable_face_swap):
-        """Process a single image with prompt generation and image generation"""
+    def generate_random_filename(self, length=32):
+        """Generate a random filename"""
+        characters = string.ascii_letters + string.digits
+        random_string = ''.join(random.choice(characters) for _ in range(length))
+        return random_string
+    
+    def process_single_image(self, image_path, selfie_path, replicate_api_key, enable_face_swap=False):
+        """Process a single image with enhanced parallel-safe processing"""
+        thread_name = threading.current_thread().name
+        
         try:
-            logger.info(f"Processing single image: {image_path}")
+            logger.info(f"[{thread_name}] Starting processing for {image_path}")
             
             # Step 1: Get ChatGPT prompt
             logger.info(f"Getting GPT-5-nano prompt for {image_path}")
-            prompt = self.get_chatgpt_prompt(str(image_path), replicate_api_key)
+            prompt = self.get_chatgpt_prompt(image_path, replicate_api_key)
             if not prompt:
                 logger.error(f"Failed to get prompt for {image_path}")
                 return None
@@ -718,280 +718,210 @@ class StreamlitImageGenerator:
             logger.info(f"Initializing face swap with server: {comfyui_server_url}")
             self.initialize_face_swap(comfyui_server_url)
         
-        # Get list of image files
-        supported_extensions = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff'}
-        image_files = []
-        
-        for file_path in Path(input_folder).iterdir():
-            if file_path.is_file() and file_path.suffix.lower() in supported_extensions:
-                image_files.append(file_path)
-        
-        logger.info(f"Found {len(image_files)} supported images to process")
-        
-        if not image_files:
-            logger.warning("No supported image files found in the input folder")
-            st.warning("No supported image files found in the input folder.")
-            return [], []
-        
-        # Save uploaded selfie temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_selfie:
-            tmp_selfie.write(selfie_file.getvalue())
-            selfie_path = tmp_selfie.name
-        
-        # Create progress tracking
-        self.progress_bar = st.progress(0)
-        self.status_text = st.empty()
-        self.results_container = st.container()
-        
-        total_images = len(image_files)
-        completed_count = 0
+        # Create temporary selfie file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_selfie:
+            temp_selfie.write(selfie_file.getvalue())
+            selfie_path = temp_selfie.name
         
         try:
-            # Process images in parallel with 10 workers
-            logger.info(f"Starting parallel processing with 10 workers for {total_images} images")
+            # Get all image files
+            input_path = Path(input_folder)
+            image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
+            image_files = [f for f in input_path.iterdir() 
+                          if f.is_file() and f.suffix.lower() in image_extensions]
             
-            with ThreadPoolExecutor(max_workers=10) as executor:
+            logger.info(f"Found {len(image_files)} images to process")
+            
+            if not image_files:
+                logger.warning("No valid image files found")
+                return [], []
+            
+            # Parallel processing with ThreadPoolExecutor
+            max_workers = 10
+            logger.info(f"Starting parallel processing with {max_workers} workers")
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 # Submit all tasks
                 future_to_image = {
                     executor.submit(
-                        self.process_single_image, 
-                        image_path, 
-                        selfie_path, 
-                        replicate_api_key, 
+                        self.process_single_image,
+                        image_file,
+                        selfie_path,
+                        replicate_api_key,
                         enable_face_swap
-                    ): image_path 
-                    for image_path in image_files
+                    ): image_file for image_file in image_files
                 }
                 
-                # Process completed tasks
+                # Collect results as they complete
                 for future in as_completed(future_to_image):
-                    image_path = future_to_image[future]
-                    completed_count += 1
-                    
+                    image_file = future_to_image[future]
                     try:
                         result = future.result()
                         if result:
                             results.append(result)
                             
-                            # Add to CSV data
-                            csv_data.append({
-                                'original_image': result['original_name'],
+                            # Create CSV row
+                            csv_row = {
+                                'original_filename': result['original_name'],
                                 'generated_filename': result['generated_filename'],
                                 'prompt': result['prompt'],
+                                'image_url': result['image_url'],
                                 'face_swapped': result['face_swapped'],
-                                'timestamp': datetime.now().isoformat()
-                            })
+                                'processing_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            }
+                            csv_data.append(csv_row)
                             
-                            logger.info(f"Successfully completed processing for {image_path.name}")
+                            logger.info(f"Completed processing: {image_file.name}")
                         else:
-                            logger.warning(f"Failed to process {image_path.name}")
-                    
+                            logger.error(f"Failed to process: {image_file.name}")
+                            
                     except Exception as e:
-                        logger.error(f"Error processing {image_path.name}: {str(e)}")
-                    
-                    # Update progress
-                    progress = completed_count / total_images
-                    self.progress_bar.progress(progress)
-                    self.status_text.text(f"Completed {completed_count}/{total_images} images")
-                    
-                    # Show result in real-time if successful
-                    if 'result' in locals() and result:
-                        with self.results_container:
-                            col1, col2 = st.columns(2)
-                            
-                            with col1:
-                                st.subheader(f"Original: {result['original_name']}")
-                                original_img = Image.open(image_path)
-                                st.image(original_img, use_container_width=True)
-                            
-                            with col2:
-                                title_suffix = " (Face Swapped)" if result['face_swapped'] else ""
-                                st.subheader(f"Generated: {result['generated_filename']}{title_suffix}")
-                                generated_img = Image.open(io.BytesIO(result['image_content']))
-                                st.image(generated_img, use_container_width=True)
-                                st.text(f"Filtered Prompt: {result['prompt']}")
-                            
-                            st.divider()
-        
+                        logger.error(f"Error processing {image_file.name}: {str(e)}")
+            
+            logger.info(f"Parallel processing completed. Successfully processed {len(results)}/{len(image_files)} images")
+            
         finally:
             # Clean up temporary selfie file
             try:
                 os.unlink(selfie_path)
-            except:
-                pass
-        
-        self.status_text.text(f"Parallel processing complete! Successfully processed {len(results)}/{total_images} images")
-        logger.info(f"Parallel processing completed. Success rate: {len(results)}/{total_images}")
+                logger.debug("Cleaned up temporary selfie file")
+            except Exception as e:
+                logger.warning(f"Failed to clean up temporary selfie file: {e}")
         
         return results, csv_data
 
 def main():
-    st.title("🎭 Seedream + Face Swap Generator (Parallel Processing)")
-    st.markdown("Generate Seedream images using filtered ChatGPT prompts, with optional face swapping and parallel processing")
+    """Main Streamlit application"""
+    st.title("🎭 Seedream Face Swap Generator")
+    st.markdown("**Advanced Parallel Processing with Direct Seedream API**")
     
-    # Check if secrets are available
-    try:
-        # Test if secrets are accessible
-        test_replicate_key = REPLICATE_API_KEY
-        test_ark_key = ARK_API_KEY
-        api_keys_configured = True
-    except Exception as e:
-        st.error("API keys not configured in Streamlit secrets. Please add REPLICATE_API_KEY and ARK_API_KEY to your secrets.")
-        api_keys_configured = False
-        return
+    # Check API keys first
+    if not check_api_keys():
+        st.stop()
     
-    # Sidebar for configuration
-    st.sidebar.header("Configuration")
-    
-    # Face swap configuration
-    st.sidebar.header("Face Swap Settings")
-    enable_face_swap = st.sidebar.checkbox(
-        "Enable Face Swap",
-        value=False,
-        help="Swap faces in generated images with your selfie"
-    )
-    
-    # Always define comfyui_server_url
-    comfyui_server_url = COMFYUI_SERVER_URL if enable_face_swap else None
-    
-    # File uploads
-    st.sidebar.header("File Inputs")
+    # Sidebar configuration
+    st.sidebar.header("⚙️ Configuration")
     
     # Input method selection
-    input_method = st.sidebar.radio(
+    input_method = st.sidebar.selectbox(
         "Choose input method:",
-        ["Upload individual images", "Upload ZIP file"]
+        ["Upload individual images"]
     )
     
-    uploaded_images = []
-    uploaded_zip = None
+    # Face swap option
+    enable_face_swap = st.sidebar.checkbox(
+        "🔄 Enable Face Swapping",
+        value=False,
+        help="Use ComfyUI to swap faces in generated images with your selfie"
+    )
     
-    if input_method == "Upload individual images":
-        uploaded_files = st.sidebar.file_uploader(
-            "Upload Images for Processing",
-            type=['jpg', 'jpeg', 'png', 'webp', 'bmp', 'tiff'],
-            accept_multiple_files=True,
-            help="Upload multiple images to process"
-        )
-        uploaded_images = uploaded_files if uploaded_files else []
+    # ComfyUI server configuration (only show if face swap is enabled)
+    comfyui_server_url = None
+    if enable_face_swap:
+        # Use the configured server URL from secrets/env vars
+        comfyui_server_url = COMFYUI_SERVER_URL
+        st.sidebar.info(f"🖥️ ComfyUI Server: {comfyui_server_url[:30]}..." if comfyui_server_url else "❌ ComfyUI Server not configured")
+    
+    # Display workflow information
+    st.sidebar.markdown("---")
+    st.sidebar.header("📋 Process Overview")
+    
+    if enable_face_swap:
+        workflow_description = """
+        The app will process images in parallel with 10 workers:
+        1. Generate concise, effective prompts from uploaded images using ChatGPT (GPT-5-nano) via Replicate
+        2. **Focus on key visual elements** without facial expressions
+        3. Use the optimized prompts with your selfie to create new images via **Seedream API directly**
+        4. **Perform face swapping** to replace faces in generated images with your selfie
+        5. Generate random 32-character filenames for all outputs
+        6. Create a CSV file with all prompts and metadata
+        
+        **Note**: GPT-5-nano creates focused, practical prompts without facial expressions.
+        """
     else:
-        uploaded_zip = st.sidebar.file_uploader(
-            "Upload ZIP file containing images",
-            type=['zip'],
-            help="Upload a ZIP file containing images to process"
-        )
+        workflow_description = """
+        The app will process images in parallel with 10 workers:
+        1. Generate concise, effective prompts from uploaded images using ChatGPT (GPT-5-nano) via Replicate
+        2. **Focus on key visual elements** without facial expressions
+        3. Use the optimized prompts with your selfie to create new images via **Seedream API directly**
+        4. Generate random 32-character filenames for all outputs
+        5. Create a CSV file with all prompts and metadata
+        
+        **Note**: GPT-5-nano creates focused, practical prompts without facial expressions.
+        **Performance**: Up to 10 images are processed simultaneously for faster results.
+        **API**: Uses Seedream API directly (not via Replicate) for image generation.
+        """
     
-    # Selfie upload
-    selfie_file = st.sidebar.file_uploader(
-        "Upload Your Selfie",
-        type=['jpg', 'jpeg', 'png'],
-        help="This selfie will be used as reference for image generation and face swapping"
-    )
+    st.sidebar.markdown(workflow_description)
+    
+    # Expression filtering info
+    st.sidebar.markdown("---")
+    st.sidebar.header("🎯 Features")
+    st.sidebar.markdown("""
+    - **Parallel Processing**: 10 concurrent workers
+    - **Expression Prevention**: No facial expressions in prompts
+    - **Direct API**: Seedream API (not via Replicate)
+    - **Random Filenames**: 32-character unique names
+    - **Comprehensive Reports**: CSV + ZIP downloads
+    - **Face Swapping**: Optional ComfyUI integration
+    """)
     
     # Main content area
-    col1, col2 = st.columns([2, 1])
+    st.header("📤 Upload Files")
+    
+    # File uploaders
+    col1, col2 = st.columns([1, 1])
     
     with col1:
-        st.header("Instructions")
+        st.subheader("🤳 Your Selfie")
+        selfie_file = st.file_uploader(
+            "Upload your selfie image:",
+            type=['jpg', 'jpeg', 'png'],
+            help="This image will be used as the face source for generation and swapping"
+        )
         
-        workflow_steps = [
-            "**API keys are configured** in Streamlit secrets",
-            "**Upload images** you want to process",
-            "**Upload your selfie** that will be used as reference",
-            "**Optionally enable face swapping** for more realistic results",
-            "**Click 'Start Processing'** to begin parallel processing"
-        ]
-        
-        if enable_face_swap:
-            workflow_description = """
-            The app will process images in parallel with 10 workers:
-            1. Generate prompts from uploaded images using ChatGPT (GPT-5-nano) via Replicate
-            2. **Filter out facial expressions** from the generated prompts
-            3. Use the filtered prompts with your selfie to create new images via **Seedream API directly**
-            4. **Perform face swapping** to replace faces in generated images with your selfie
-            5. Generate random 32-character filenames for all outputs
-            6. Create a CSV file with all prompts and metadata
-            
-            **Note**: Expressions like "smiling", "happy", "sad", etc. are automatically removed from prompts.
-            **Performance**: Up to 10 images are processed simultaneously for faster results.
-            **API**: Uses Seedream API directly (not via Replicate) for image generation.
-            """
-        else:
-            workflow_description = """
-            The app will process images in parallel with 10 workers:
-            1. Generate prompts from uploaded images using ChatGPT (GPT-5-nano) via Replicate
-            2. **Filter out facial expressions** from the generated prompts
-            3. Use the filtered prompts with your selfie to create new images via **Seedream API directly**
-            4. Generate random 32-character filenames for all outputs
-            5. Create a CSV file with all prompts and metadata
-            
-            **Note**: Expressions like "smiling", "happy", "sad", etc. are automatically removed from prompts.
-            **Performance**: Up to 10 images are processed simultaneously for faster results.
-            **API**: Uses Seedream API directly (not via Replicate) for image generation.
-            """
-        
-        for i, step in enumerate(workflow_steps, 1):
-            st.markdown(f"{i}. {step}")
-        
-        st.markdown(workflow_description)
-        
-        # Expression filtering info
-        st.info("""
-        **🎭 Expression Filtering**: The system automatically removes facial expressions from prompts to ensure neutral faces in generated images. 
-        Filtered expressions include: smiling, happy, sad, angry, surprised, serious, laughing, crying, worried, excited, and many more.
-        """)
-        
-        # Parallel processing info
-        st.info("""
-        **⚡ Parallel Processing**: Uses 10 concurrent workers to process multiple images simultaneously, significantly reducing total processing time.
-        """)
-        
-        # API info
-        st.info("""
-        **🔌 Direct Seedream API**: Uses Seedream API directly instead of via Replicate for faster and more reliable image generation.
-        """)
+        if selfie_file:
+            selfie_image = Image.open(selfie_file)
+            st.image(selfie_image, caption="Your uploaded selfie", use_column_width=True)
     
     with col2:
-        st.header("Current Status")
-        
-        # Check if images are available based on input method
+        st.subheader("🖼️ Images to Process")
         if input_method == "Upload individual images":
-            has_images = bool(uploaded_images)
-            image_info = f"({len(uploaded_images)} files)" if uploaded_images else ""
-        else:
-            has_images = bool(uploaded_zip)
-            image_info = f"({uploaded_zip.name})" if uploaded_zip else ""
-        
-        has_selfie = bool(selfie_file)
-        
-        checks = []
-        checks.append(("API Keys Configured", "✅" if api_keys_configured else "❌ Check secrets"))
-        
-        if input_method == "Upload individual images":
-            checks.append(("Images Uploaded", f"✅ {image_info}" if has_images else "❌"))
-        else:
-            checks.append(("ZIP File Uploaded", f"✅ {image_info}" if has_images else "❌"))
+            uploaded_images = st.file_uploader(
+                "Upload images to process:",
+                type=['jpg', 'jpeg', 'png', 'bmp', 'gif', 'tiff', 'webp'],
+                accept_multiple_files=True,
+                help="Upload multiple images that will be used to generate creative prompts"
+            )
             
-        checks.append(("Selfie Uploaded", "✅" if has_selfie else "❌"))
-        checks.append(("Parallel Processing", "✅ 10 Workers"))
-        checks.append(("Expression Filtering", "✅ Enabled"))
-        checks.append(("Seedream API", "✅ Direct API"))
-        
-        if enable_face_swap:
-            checks.append(("ComfyUI Server", "✅" if COMFYUI_SERVER_URL else "❌"))
-        
-        for check_name, status in checks:
-            st.text(f"{check_name}: {status}")
-        
-        if enable_face_swap:
-            st.info("🎭 Face swap enabled - processing will take longer but results will be more realistic")
+            if uploaded_images:
+                st.success(f"✅ {len(uploaded_images)} images uploaded")
+                
+                # Show preview of uploaded images
+                if len(uploaded_images) <= 5:
+                    st.write("**Preview:**")
+                    preview_cols = st.columns(min(len(uploaded_images), 3))
+                    for i, img_file in enumerate(uploaded_images[:3]):
+                        with preview_cols[i]:
+                            img = Image.open(img_file)
+                            st.image(img, caption=img_file.name, use_column_width=True)
+                    
+                    if len(uploaded_images) > 3:
+                        st.info(f"...and {len(uploaded_images) - 3} more images")
+                else:
+                    st.info(f"📁 {len(uploaded_images)} images ready for processing")
     
     # Processing section
-    st.header("Processing")
+    st.header("🚀 Start Processing")
     
-    required_items = [api_keys_configured, uploaded_images, selfie_file]
-    
-    if st.button("🚀 Start Parallel Processing", type="primary", disabled=not all(required_items)):
+    # Validation and processing button
+    if st.button("🎬 Generate Images", type="primary", use_container_width=True):
+        # Validate inputs
+        required_items = [selfie_file]
+        
+        if input_method == "Upload individual images":
+            required_items.extend([uploaded_images])
+        
         if not all(required_items):
             st.error("Please provide all required inputs before starting.")
             return
@@ -1017,9 +947,9 @@ def main():
             if results:
                 success_message = f"Successfully processed {len(results)} images with parallel processing!"
                 if enable_face_swap:
-                    success_message += " (with face swapping and expression filtering using direct Seedream API)"
+                    success_message += " (with face swapping and optimized prompts using direct Seedream API)"
                 else:
-                    success_message += " (with expression filtering using direct Seedream API)"
+                    success_message += " (with optimized prompts using direct Seedream API)"
                 st.success(success_message)
                 
                 # Create downloadable files section
@@ -1039,7 +969,7 @@ def main():
                     csv_header += f"# Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                     csv_header += f"# Total images processed: {len(results)}\n"
                     csv_header += f"# Face swap enabled: {enable_face_swap}\n"
-                    csv_header += f"# Expression filtering: Enabled\n"
+                    csv_header += f"# Optimized prompts: Enabled\n"
                     csv_header += f"# Parallel workers: 10\n"
                     csv_header += f"# Input method: {input_method}\n"
                     csv_header += f"# Seedream API: Direct API (not via Replicate)\n"
@@ -1053,7 +983,7 @@ def main():
                         data=csv_content,
                         file_name=f"seedream_report_parallel_{timestamp}.csv",
                         mime="text/csv",
-                        help="Download detailed report with filtered prompts and metadata"
+                        help="Download detailed report with optimized prompts and metadata"
                     )
                 
                 # Enhanced ZIP with organized structure
@@ -1086,19 +1016,19 @@ def main():
                     summary += f"Input method: {input_method}\n"
                     summary += f"Total images processed: {len(results)}\n"
                     summary += f"Face swap enabled: {enable_face_swap}\n"
-                    summary += f"Expression filtering: Enabled\n"
+                    summary += f"Optimized prompts: Enabled\n"
                     summary += f"Parallel workers: 10\n"
                     summary += f"Success rate: {(len(results)/len(uploaded_images)*100):.1f}%\n"
                     summary += f"Seedream API: Direct API (not via Replicate)\n\n"
                     summary += "Features:\n"
-                    summary += "- Automatic expression filtering from prompts\n"
+                    summary += "- Concise, effective prompts focused on key visual elements\n"
                     summary += "- Parallel processing with 10 concurrent workers\n"
                     summary += "- Random 32-character filenames\n"
                     summary += "- Direct Seedream API for faster generation\n"
                     summary += f"- Face swapping: {'Enabled' if enable_face_swap else 'Disabled'}\n\n"
                     summary += "Files included:\n"
                     summary += "- generated_images/: All generated images\n"
-                    summary += "- processing_report.csv: Detailed report with filtered prompts\n"
+                    summary += "- processing_report.csv: Detailed report with optimized prompts\n"
                     if input_method == "Upload individual images":
                         summary += "- original_reference.txt: Mapping of original to generated filenames\n"
                     
@@ -1141,7 +1071,7 @@ def main():
                 process_info = f"""
                 - **Input Method**: {input_method}
                 - **Face Swapping**: {'Enabled' if enable_face_swap else 'Disabled'}
-                - **Expression Filtering**: Enabled (removes facial expressions from prompts)
+                - **Expression Handling**: Avoided during prompt generation
                 - **Parallel Processing**: 10 concurrent workers
                 - **Processing Time**: Completed at {datetime.now().strftime('%H:%M:%S')}
                 - **Output Format**: Random 32-character filenames
@@ -1150,7 +1080,7 @@ def main():
                 """
                 
                 if enable_face_swap:
-                    process_info += f"\n- **ComfyUI Server**: {COMFYUI_SERVER_URL}"
+                    process_info += f"\n- **ComfyUI Server**: {COMFYUI_SERVER_URL[:30]}..." if COMFYUI_SERVER_URL else "\n- **ComfyUI Server**: Not configured"
                 
                 st.markdown(process_info)
             
@@ -1159,7 +1089,7 @@ def main():
     
     # Footer
     st.markdown("---")
-    st.markdown("Made with Streamlit, Replicate GPT-5-nano, and Direct Seedream API | **Features**: Expression Filtering + Parallel Processing + Direct API")
+    st.markdown("Made with Streamlit, Replicate GPT-5-nano, and Direct Seedream API | **Features**: Optimized Prompts + Parallel Processing + Direct API")
     
     # Display current log file info
     if st.sidebar.button("View Log Info"):
